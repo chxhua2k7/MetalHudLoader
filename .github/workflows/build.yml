@@ -1,0 +1,59 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install make ldid xz
+
+      - name: Checkout Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          path: theos
+          submodules: recursive
+
+      # Only the one SDK the Makefile pins; a full theos/sdks clone is huge.
+      - name: Fetch iOS 16.5 SDK
+        run: |
+          git clone --depth=1 --filter=tree:0 --no-checkout https://github.com/theos/sdks.git /tmp/sdks
+          git -C /tmp/sdks sparse-checkout set iPhoneOS16.5.sdk
+          git -C /tmp/sdks checkout
+          mkdir -p theos/sdks
+          mv /tmp/sdks/iPhoneOS16.5.sdk theos/sdks/
+
+      - name: Build package
+        run: |
+          export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
+          make package FINALPACKAGE=1
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Read version
+        id: version
+        run: echo "version=$(awk '/^Version:/ {print $2}' control)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MetalHudLoader-${{ steps.version.outputs.version }}
+          path: packages/*.deb
+
+      - name: Publish release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: MetalHudLoader ${{ steps.version.outputs.version }}
+          files: packages/*.deb
