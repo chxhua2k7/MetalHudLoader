@@ -1,4 +1,4 @@
-TARGET := iphone:clang:latest
+TARGET := iphone:clang:16.5:15.0
 THEOS_PACKAGE_SCHEME = rootless
 export ARCHS = arm64 arm64e
 
@@ -10,4 +10,6 @@ $(TWEAK_NAME)_FRAMEWORKS = Foundation
 $(TWEAK_NAME)_FILES = init.m
 
 include $(THEOS_MAKE_PATH)/tweak.mk
-include $(THEOS_MAKE_PATH)/tool.mk
+
+SUBPROJECTS += ccmodule
+include $(THEOS_MAKE_PATH)/aggregate.mk
