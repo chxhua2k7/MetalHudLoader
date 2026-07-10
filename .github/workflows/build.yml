@@ -46,20 +46,22 @@ jobs:
         env:
           THEOS: ${{ github.workspace }}/theos
 
-      - name: Read version
-        id: version
-        run: echo "version=$(awk '/^Version:/ {print $2}' control)" >> "$GITHUB_OUTPUT"
+      - name: Read package info
+        id: info
+        run: |
+          echo "version=$(awk '/^Version:/ {print $2}' control)" >> "$GITHUB_OUTPUT"
+          echo "name=$(awk '/^TWEAK_NAME/ {print $NF}' Makefile)" >> "$GITHUB_OUTPUT"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MetalHudLoader-${{ steps.version.outputs.version }}
+          name: ${{ steps.info.outputs.name }}-${{ steps.info.outputs.version }}
           path: packages/*.deb
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: MetalHudLoader ${{ steps.version.outputs.version }}
+          tag_name: v${{ steps.info.outputs.version }}
+          name: ${{ steps.info.outputs.name }} ${{ steps.info.outputs.version }}
           prerelease: ${{ github.ref != 'refs/heads/main' }}
           files: packages/*.deb
