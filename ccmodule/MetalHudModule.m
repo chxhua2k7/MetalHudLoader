@@ -2,11 +2,126 @@
 #import <notify.h>
 #import "../shared.h"
 
+@interface CCUIMenuModuleItem : NSObject
+@property (nonatomic, getter=isSelected) BOOL selected;
+- (instancetype)initWithTitle:(NSString *)title identifier:(NSString *)identifier handler:(BOOL (^)(void))handler;
+@end
+
+@interface CCUIMenuModuleViewController : UIViewController
+@property (copy, nonatomic) NSString *title;
+@property (nonatomic) BOOL useTrailingCheckmarkLayout;
+@property (nonatomic, getter=isSelected) BOOL selected;
+@property (retain, nonatomic) UIImage *glyphImage;
+@property (retain, nonatomic) UIImage *selectedGlyphImage;
+@property (retain, nonatomic) UIColor *selectedGlyphColor;
+@property (nonatomic, weak) id contentModuleContext;
+- (void)setMenuItems:(NSArray *)menuItems;
+@end
+
 @interface CCUIToggleModule : NSObject
 @property (nonatomic, getter=isSelected) BOOL selected;
+- (UIImage *)iconGlyph;
+- (UIColor *)selectedColor;
+- (id)contentViewControllerForContext:(id)context;
 @end
 
 @interface MetalHudModule : CCUIToggleModule
+- (uint64_t)elementsMask;
+- (void)updateElementsMask:(uint64_t)mask;
+@end
+
+@interface MHLMenuViewController : CCUIMenuModuleViewController
+@property (nonatomic, weak) MetalHudModule *module;
+@end
+
+@implementation MHLMenuViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Metal HUD";
+    self.glyphImage = self.module.iconGlyph;
+    self.selectedGlyphImage = self.module.iconGlyph;
+    self.selectedGlyphColor = self.module.selectedColor;
+    self.selected = self.module.isSelected;
+    // Private bits that gate the long-press menu; if they change in some
+    // iOS version, degrade to a plain toggle instead of crashing.
+    @try {
+        self.useTrailingCheckmarkLayout = YES;
+        [self setValue:@YES forKey:@"allowsMenuInteraction"];
+    } @catch (NSException *exception) {}
+    [self reloadMenuItems];
+}
+
+- (void)reloadMenuItems {
+    uint64_t mask = self.module.elementsMask;
+    NSMutableArray *items = [NSMutableArray new];
+    __weak MHLMenuViewController *weakSelf = self;
+
+    @try {
+        CCUIMenuModuleItem *defaultItem = [[CCUIMenuModuleItem alloc] initWithTitle:@"Default (all)"
+                                                                         identifier:@"default"
+                                                                            handler:^BOOL {
+            [weakSelf.module updateElementsMask:0];
+            [weakSelf reloadMenuItems];
+            return NO;
+        }];
+        defaultItem.selected = mask == 0;
+        [items addObject:defaultItem];
+
+        for (uint64_t i = 0; i < MHLElementCount; i++) {
+            uint64_t bit = 1ULL << i;
+            CCUIMenuModuleItem *item = [[CCUIMenuModuleItem alloc] initWithTitle:@(MHLElementNames[i])
+                                                                      identifier:@(MHLElementNames[i])
+                                                                         handler:^BOOL {
+                [weakSelf.module updateElementsMask:weakSelf.module.elementsMask ^ bit];
+                [weakSelf reloadMenuItems];
+                return NO;
+            }];
+            item.selected = (mask & bit) != 0;
+            [items addObject:item];
+        }
+
+        [self setMenuItems:items];
+    } @catch (NSException *exception) {}
+}
+
+- (void)buttonTapped:(id)button forEvent:(id)event {
+    BOOL selected = !self.module.isSelected;
+    self.module.selected = selected;
+    self.selected = selected;
+    if (selected) {
+        [self spinGlyph];
+    }
+}
+
+static void collectImageViews(UIView *view, NSMutableArray<UIImageView *> *out) {
+    if ([view isKindOfClass:UIImageView.class]) {
+        [out addObject:(UIImageView *)view];
+    }
+    for (UIView *subview in view.subviews) {
+        collectImageViews(subview, out);
+    }
+}
+
+- (void)spinGlyph {
+    if (!self.viewIfLoaded) {
+        return;
+    }
+
+    NSMutableArray<UIImageView *> *glyphViews = [NSMutableArray new];
+    collectImageViews(self.viewIfLoaded, glyphViews);
+
+    CABasicAnimation *spin = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
+    spin.fromValue = @0;
+    spin.toValue = @(2 * M_PI);
+    spin.duration = 0.6;
+    spin.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+
+    for (UIImageView *glyphView in glyphViews) {
+        [glyphView.layer addAnimation:spin forKey:@"mhl.spin"];
+    }
+}
+
 @end
 
 @implementation MetalHudModule
@@ -22,6 +137,10 @@ static int stateToken(void) {
         }
     });
     return token;
+}
+
+static NSMutableDictionary *readPrefs(void) {
+    return [[NSDictionary dictionaryWithContentsOfFile:@kMHLPrefsPath] mutableCopy] ?: [NSMutableDictionary new];
 }
 
 - (UIImage *)iconGlyph {
@@ -41,68 +160,54 @@ static int stateToken(void) {
     if (token != NOTIFY_TOKEN_INVALID) {
         notify_get_state(token, &state);
     }
-    return state != MHLStateDisabled;
+    return (state & MHLEnabledFieldMask) != MHLStateDisabled;
 }
 
 - (void)setSelected:(BOOL)selected {
+    NSMutableDictionary *prefs = readPrefs();
+    prefs[@kMHLEnabledKey] = @(selected);
+    [prefs writeToFile:@kMHLPrefsPath atomically:YES];
+
     int token = stateToken();
     if (token != NOTIFY_TOKEN_INVALID) {
-        notify_set_state(token, selected ? MHLStateEnabled : MHLStateDisabled);
+        notify_set_state(token, MHLStateMake(selected, MHLElementsMaskFromPrefs(prefs)));
     }
-
-    [@{ @kMHLEnabledKey: @(selected) } writeToFile:@kMHLPrefsPath atomically:YES];
 
     [super setSelected:selected];
+}
 
-    if (selected) {
-        [self spinGlyph];
+- (uint64_t)elementsMask {
+    return MHLElementsMaskFromPrefs(readPrefs());
+}
+
+- (void)updateElementsMask:(uint64_t)mask {
+    NSMutableDictionary *prefs = readPrefs();
+    if (mask != 0) {
+        NSMutableArray<NSString *> *names = [NSMutableArray new];
+        for (uint64_t i = 0; i < MHLElementCount; i++) {
+            if (mask & (1ULL << i)) {
+                [names addObject:@(MHLElementNames[i])];
+            }
+        }
+        prefs[@kMHLElementsKey] = [names componentsJoinedByString:@","];
+    } else {
+        [prefs removeObjectForKey:@kMHLElementsKey];
+    }
+    [prefs writeToFile:@kMHLPrefsPath atomically:YES];
+
+    int token = stateToken();
+    if (token != NOTIFY_TOKEN_INVALID) {
+        notify_set_state(token, MHLStateMake(self.isSelected, mask));
     }
 }
 
-// The glyph image view isn't exposed by CCUIToggleModule, so walk the
-// button's view hierarchy instead of relying on private subview names.
-static void collectImageViews(UIView *view, NSMutableArray<UIImageView *> *out) {
-    if ([view isKindOfClass:UIImageView.class]) {
-        [out addObject:(UIImageView *)view];
-    }
-    for (UIView *subview in view.subviews) {
-        collectImageViews(subview, out);
-    }
-}
-
-- (void)spinGlyph {
-    // CCUIToggleModule has no contentViewController getter; its view
-    // controllers live in the private _contentViewControllers hash table.
-    // Everything here is best-effort: on any surprise, skip the animation
-    // rather than take down SpringBoard.
-    NSMutableArray<UIImageView *> *glyphViews = [NSMutableArray new];
+- (id)contentViewControllerForContext:(id)context {
+    MHLMenuViewController *viewController = [MHLMenuViewController new];
+    viewController.module = self;
     @try {
-        id viewControllers = [self valueForKey:@"contentViewControllers"];
-        if (![viewControllers respondsToSelector:@selector(allObjects)]) {
-            return;
-        }
-        for (id viewController in [viewControllers allObjects]) {
-            if (![viewController isKindOfClass:UIViewController.class]) {
-                continue;
-            }
-            UIView *contentView = ((UIViewController *)viewController).viewIfLoaded;
-            if (contentView) {
-                collectImageViews(contentView, glyphViews);
-            }
-        }
-    } @catch (NSException *exception) {
-        return;
-    }
-
-    CABasicAnimation *spin = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
-    spin.fromValue = @0;
-    spin.toValue = @(2 * M_PI);
-    spin.duration = 0.6;
-    spin.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
-
-    for (UIImageView *glyphView in glyphViews) {
-        [glyphView.layer addAnimation:spin forKey:@"mhl.spin"];
-    }
+        viewController.contentModuleContext = context;
+    } @catch (NSException *exception) {}
+    return viewController;
 }
 
 @end
